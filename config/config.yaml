@@ -1,0 +1,13 @@
+dwa_planner:
+  ros__parameters:
+    max_speed: 0.22
+    max_yaw_rate: 1.0
+    min_speed: -0.22
+    predict_time: 4.0
+    robot_radius: 0.13
+    goal_cost_gain: 2.0
+    speed_cost_gain: 0.1
+    obs_cost_gain: 1.0
+    smoothness_cost_gain: 0.05
+    enable_backwards: true
+    enable_path_smoothing: true
