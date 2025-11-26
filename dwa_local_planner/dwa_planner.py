@@ -1,607 +1,401 @@
-# ROS subscribers/publishers
-        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                        history=HistoryPolicy.KEEP_LAST, depth=10)
-        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
-        self.sub_scan = self.create_subscription(LaserScan, '/scan', self.scan_cb, qos_profile=qos)
-        self.sub_goal = self.create_subscription(PoseStamped, '/goal_pose', self.goal_cb, 10)
-        self.sub_rviz_goal = self.create_subscription(PoseStamped, '/move_base_simple/goal', self.goal_cb, 10)
-        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.pub_vis = self.create_publisher(MarkerArray, '/dwa_vis', 10)
+def publish_goal_marker(self):
+        """Publish goal position with text label in RViz"""
+        if self.goal is None:
+            return
         
-        self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("DWB Local Planner initialized (Nav2 Python Port)")#!/usr/bin/env python3
+        # Create sphere marker for goal position
+        goal_sphere = Marker()
+        goal_sphere.header.frame_id = "map"
+        goal_sphere.type = Marker.SPHERE
+        goal_sphere.action = Marker.ADD
+        goal_sphere.id = 100
+        goal_sphere.pose.position.x = float(self.goal[0])
+        goal_sphere.pose.position.y = float(self.goal[1])
+        goal_sphere.pose.position.z = 0.1
+        goal_sphere.scale.x = 0.15
+        goal_sphere.scale.y = 0.15
+        goal_sphere.scale.z = 0.15
+        goal_sphere.color.r = 0.0
+        goal_sphere.color.g = 1.0
+        goal_sphere.color.b = 0.0
+        goal_sphere.color.a = 0.8
+        
+        # Create text marker with coordinates
+        goal_text = Marker()
+        goal_text.header.frame_id = "map"
+        goal_text.type = Marker.TEXT_VIEW_FACING
+        goal_text.action = Marker.ADD
+        goal_text.id = 101
+        goal_text.pose.position.x = float(self.goal[0])
+        goal_text.pose.position.y = float(self.goal[1])
+        goal_text.pose.position.z = 0.35
+        goal_text.scale.z = 0.1
+        goal_text.color.r = 1.0
+        goal_text.color.g = 1.0
+        goal_text.color.b = 0.0
+        goal_text.color.a = 1.0
+        goal_text.text = f"Goal\n({self.goal[0]:.2f}, {self.goal[1]:.2f})"
+        
+        self.pub_goal_marker.publish(goal_sphere)
+        self.pub_goal_marker.publish(goal_text)
+
+def main(args=None):    def goal_cb(self, msg):
+        self.goal = np.array([msg.pose.position.x, msg.pose.position.y])
+        self.get_logger().info(f"New Goal: {self.goal}")
+        self.publish_goal_marker()#!/usr/bin/env python3
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import Twist, Point, PoseStamped, Pose
-from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import Twist, Point, PoseStamped
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 from tf_transformations import euler_from_quaternion
 import math
 import numpy as np
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Tuple
-import copy
+from scipy.interpolate import CubicSpline
 
-# ============================================================================
-# DATA STRUCTURES
-# ============================================================================
-
-@dataclass
-class Trajectory2D:
-    """Represents a 2D trajectory"""
-    vx: float = 0.0
-    vy: float = 0.0
-    theta: float = 0.0
-    
-    def __eq__(self, other):
-        return (self.vx == other.vx and 
-                self.vy == other.vy and 
-                self.theta == other.theta)
-
-@dataclass
-class CriticScore:
-    """Score from a single critic"""
-    name: str = ""
-    raw_score: float = 0.0
-    scale: float = 1.0
-
-@dataclass
-class TrajectoryScore:
-    """Total score for a trajectory"""
-    traj: Trajectory2D = None
-    scores: List[CriticScore] = None
-    total: float = 0.0
-    
-    def __post_init__(self):
-        if self.traj is None:
-            self.traj = Trajectory2D()
-        if self.scores is None:
-            self.scores = []
-
-# ============================================================================
-# TRAJECTORY GENERATOR (Equivalent to Nav2's)
-# ============================================================================
-
-class TrajectoryGenerator:
-    """Generates candidate trajectories for DWA sampling"""
-    
-    def __init__(self, max_speed: float, max_yaw_rate: float,
-                 accel_lim_x: float, accel_lim_theta: float,
-                 predict_time: float, sim_granularity: float,
-                 v_samples: int, theta_samples: int):
-        self.max_speed = max_speed
-        self.max_yaw_rate = max_yaw_rate
-        self.accel_lim_x = accel_lim_x
-        self.accel_lim_theta = accel_lim_theta
-        self.predict_time = predict_time
-        self.sim_granularity = sim_granularity
-        self.v_samples = v_samples
-        self.theta_samples = theta_samples
-        
-        self.velocity_iterator = []
-        self.yaw_iterator = []
-        self.v_index = 0
-        self.theta_index = 0
-    
-    def startNewIteration(self, current_velocity: Trajectory2D):
-        """Reset iterators and prepare for new iteration"""
-        # Dynamic Window - acceleration limits
-        min_v = max(0.0, current_velocity.vx - self.accel_lim_x * self.sim_granularity)
-        max_v = min(self.max_speed, current_velocity.vx + self.accel_lim_x * self.sim_granularity)
-        
-        min_theta = max(-self.max_yaw_rate, 
-                       current_velocity.theta - self.accel_lim_theta * self.sim_granularity)
-        max_theta = min(self.max_yaw_rate,
-                       current_velocity.theta + self.accel_lim_theta * self.sim_granularity)
-        
-        # Generate samples
-        self.velocity_iterator = np.linspace(min_v, max_v, self.v_samples).tolist()
-        self.yaw_iterator = np.linspace(min_theta, max_theta, self.theta_samples).tolist()
-        
-        self.v_index = 0
-        self.theta_index = 0
-    
-    def hasMoreTwists(self) -> bool:
-        """Check if more trajectories to generate"""
-        return self.v_index < len(self.velocity_iterator)
-    
-    def nextTwist(self) -> Trajectory2D:
-        """Get next velocity command"""
-        v = self.velocity_iterator[self.v_index]
-        theta = self.yaw_iterator[self.theta_index]
-        
-        twist = Trajectory2D(vx=v, vy=0.0, theta=theta)
-        
-        self.theta_index += 1
-        if self.theta_index >= len(self.yaw_iterator):
-            self.theta_index = 0
-            self.v_index += 1
-        
-        return twist
-    
-    def generateTrajectory(self, pose: Pose, velocity: Trajectory2D,
-                          twist: Trajectory2D) -> List[Tuple[float, float]]:
-        """Simulate trajectory given initial pose, current velocity, and desired twist"""
-        trajectory = []
-        x, y = 0.0, 0.0  # Local frame
-        theta = 0.0
-        
-        vx = velocity.vx
-        vtheta = velocity.theta
-        
-        time = 0.0
-        while time <= self.predict_time:
-            # Add point to trajectory
-            trajectory.append((x, y))
-            
-            # Update velocity (kinematic model)
-            vx = twist.vx
-            vtheta = twist.theta
-            
-            # Update pose
-            if abs(vtheta) < 1e-6:
-                # Straight line
-                x += vx * self.sim_granularity * math.cos(theta)
-                y += vx * self.sim_granularity * math.sin(theta)
-            else:
-                # Arc motion
-                radius = vx / vtheta
-                theta_new = theta + vtheta * self.sim_granularity
-                x += radius * (math.sin(theta_new) - math.sin(theta))
-                y += radius * (-math.cos(theta_new) + math.cos(theta))
-                theta = theta_new
-            
-            time += self.sim_granularity
-        
-        return trajectory
-
-# ============================================================================
-# TRAJECTORY CRITICS
-# ============================================================================
-
-class TrajectoryCritic(ABC):
-    """Base class for trajectory critics"""
-    
-    def __init__(self, name: str):
-        self.name = name
-        self.scale = 1.0
-    
-    def getName(self) -> str:
-        return self.name
-    
-    def getScale(self) -> float:
-        return self.scale
-    
-    def setScale(self, scale: float):
-        self.scale = scale
-    
-    def prepare(self, pose: Pose, velocity: Trajectory2D, 
-                goal_pose: Pose, transformed_plan: Path) -> bool:
-        """Prepare critic for scoring (called once per planning cycle)"""
-        return True
-    
-    @abstractmethod
-    def scoreTrajectory(self, trajectory: List[Tuple[float, float]]) -> float:
-        """Score a trajectory. Return is added to total cost."""
-        pass
-    
-    def debrief(self, cmd_vel: Trajectory2D):
-        """Called after trajectory is selected"""
-        pass
-
-class ObstacleCritic(TrajectoryCritic):
-    """Scores based on proximity to obstacles"""
-    
-    def __init__(self, name: str = "ObstacleCritic"):
-        super().__init__(name)
-        self.scale = 2.0
-        self.scan_obs = np.empty((0, 2))
-        self.robot_radius = 0.20
-    
-    def setScanData(self, obs: np.ndarray):
-        self.scan_obs = obs
-    
-    def prepare(self, pose: Pose, velocity: Trajectory2D,
-                goal_pose: Pose, transformed_plan: Path) -> bool:
-        return True
-    
-    def scoreTrajectory(self, trajectory: List[Tuple[float, float]]) -> float:
-        """Exponential cost for proximity to obstacles"""
-        if len(self.scan_obs) == 0 or len(trajectory) == 0:
-            return 0.0
-        
-        min_dist = float('inf')
-        for point in trajectory[::2]:
-            obs_array = self.scan_obs
-            point_array = np.array(point)
-            distances = np.linalg.norm(obs_array - point_array, axis=1)
-            min_dist = min(min_dist, np.min(distances))
-        
-        if min_dist < self.robot_radius:
-            return float('inf')  # Collision
-        
-        # Exponential cost
-        return max(0.0, (self.robot_radius - min_dist) * 10.0)
-
-class GoalDistanceCritic(TrajectoryCritic):
-    """Scores based on distance to goal after trajectory"""
-    
-    def __init__(self, name: str = "GoalDistanceCritic"):
-        super().__init__(name)
-        self.scale = 2.0
-        self.goal_pose = None
-    
-    def prepare(self, pose: Pose, velocity: Trajectory2D,
-                goal_pose: Pose, transformed_plan: Path) -> bool:
-        self.goal_pose = goal_pose
-        return True
-    
-    def scoreTrajectory(self, trajectory: List[Tuple[float, float]]) -> float:
-        """Distance from trajectory end to goal"""
-        if self.goal_pose is None or len(trajectory) == 0:
-            return float('inf')
-        
-        end_pos = np.array(trajectory[-1])
-        goal_pos = np.array([self.goal_pose.position.x, self.goal_pose.position.y])
-        
-        distance = np.linalg.norm(goal_pos - end_pos)
-        return distance
-
-class SpeedCritic(TrajectoryCritic):
-    """Encourages forward motion"""
-    
-    def __init__(self, name: str = "SpeedCritic"):
-        super().__init__(name)
-        self.scale = 0.1
-        self.max_speed = 0.18
-        self.velocity = None
-    
-    def prepare(self, pose: Pose, velocity: Trajectory2D,
-                goal_pose: Pose, transformed_plan: Path) -> bool:
-        self.velocity = velocity
-        return True
-    
-    def scoreTrajectory(self, trajectory: List[Tuple[float, float]]) -> float:
-        """Penalize low speed"""
-        if self.velocity is None:
-            return float('inf')
-        
-        return (self.max_speed - self.velocity.vx)
-
-class PathCritic(TrajectoryCritic):
-    """Scores based on alignment with global path"""
-    
-    def __init__(self, name: str = "PathCritic"):
-        super().__init__(name)
-        self.scale = 0.5
-        self.transformed_plan = None
-    
-    def prepare(self, pose: Pose, velocity: Trajectory2D,
-                goal_pose: Pose, transformed_plan: Path) -> bool:
-        self.transformed_plan = transformed_plan
-        return True
-    
-    def scoreTrajectory(self, trajectory: List[Tuple[float, float]]) -> float:
-        """Distance from trajectory to path"""
-        if self.transformed_plan is None or len(trajectory) == 0:
-            return 0.0
-        
-        end_pos = np.array(trajectory[-1])
-        min_path_dist = float('inf')
-        
-        for pose in self.transformed_plan.poses:
-            path_pos = np.array([pose.pose.position.x, pose.pose.position.y])
-            dist = np.linalg.norm(path_pos - end_pos)
-            min_path_dist = min(min_path_dist, dist)
-        
-        return min_path_dist
-
-# ============================================================================
-# DWB LOCAL PLANNER (Exact Nav2 Python Port)
-# ============================================================================
-
-class DWBLocalPlanner(Node):
-    """Equivalent to dwb_core::DWBLocalPlanner in C++"""
-    
+class EnhancedDWAPlanner(Node):
     def __init__(self):
-        super().__init__('dwb_local_planner')
+        super().__init__('enhanced_dwa_planner')
         
-        # Parameters (equivalent to ROS parameter declarations)
-        self.max_speed = 0.18
-        self.max_yaw_rate = 1.0
-        self.accel_lim_x = 1.0
-        self.accel_lim_theta = 2.0
-        self.predict_time = 2.0
-        self.sim_granularity = 0.1
-        self.robot_radius = 0.20
-        self.transform_tolerance = 0.1
-        self.short_circuit_trajectory_evaluation = True
-        self.debug_trajectory_details = False
+        # --- Declare Parameters ---
+        self.declare_parameter('max_speed', 0.22)
+        self.declare_parameter('max_yaw_rate', 1.0)
+        self.declare_parameter('min_speed', -0.22)  # Backwards motion
+        self.declare_parameter('predict_time', 4.0)
+        self.declare_parameter('dt', 0.1)
+        self.declare_parameter('v_reso', 0.02)
+        self.declare_parameter('w_reso', 0.05)
+        self.declare_parameter('robot_radius', 0.13)
+        self.declare_parameter('goal_cost_gain', 2.0)
+        self.declare_parameter('speed_cost_gain', 0.1)
+        self.declare_parameter('obs_cost_gain', 1.0)
+        self.declare_parameter('smoothness_cost_gain', 0.05)  # Penalize jerk
+        self.declare_parameter('max_obstacle_range', 3.0)
+        self.declare_parameter('goal_tolerance', 0.20)
+        self.declare_parameter('enable_backwards', True)
+        self.declare_parameter('enable_path_smoothing', True)
         
-        # Trajectory generator (plugin-like in Nav2)
-        self.traj_generator = TrajectoryGenerator(
-            max_speed=self.max_speed,
-            max_yaw_rate=self.max_yaw_rate,
-            accel_lim_x=self.accel_lim_x,
-            accel_lim_theta=self.accel_lim_theta,
-            predict_time=self.predict_time,
-            sim_granularity=self.sim_granularity,
-            v_samples=15,
-            theta_samples=15
-        )
+        # --- Load Parameters ---
+        self.load_parameters()
         
-        # Initialize critics (equivalent to loadCritics())
-        self.critics: List[TrajectoryCritic] = [
-            ObstacleCritic("ObstacleCritic"),
-            GoalDistanceCritic("GoalDistanceCritic"),
-            SpeedCritic("SpeedCritic"),
-            PathCritic("PathCritic"),
-        ]
-        
-        # Robot state
-        self.pose = Pose()
-        self.velocity = Trajectory2D()
-        self.goal_pose = Pose()
-        self.global_plan = Path()  # Store global path
-        self.transformed_plan = Path()
+        # --- State ---
+        self.goal = None
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.v = 0.0
+        self.w = 0.0
         self.scan_obs = np.empty((0, 2))
+        self.last_v = 0.0
+        self.last_w = 0.0
+
+        # --- ROS Setup ---
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         
-        # ROS subscribers/publishers
-        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                        history=HistoryPolicy.KEEP_LAST, depth=10)
         self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.sub_scan = self.create_subscription(LaserScan, '/scan', self.scan_cb, qos_profile=qos)
-        self.sub_goal = self.create_subscription(PoseStamped, '/goal_pose', self.goal_cb, 10)
+        self.sub_goal_1 = self.create_subscription(PoseStamped, '/move_base_simple/goal', self.goal_cb, 10)
+        
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pub_vis = self.create_publisher(MarkerArray, '/dwa_vis', 10)
-    
-    def odom_cb(self, msg: Odometry):
-        """Update robot pose and velocity"""
-        self.pose.position.x = msg.pose.pose.position.x
-        self.pose.position.y = msg.pose.pose.position.y
-        self.pose.position.z = msg.pose.pose.position.z
-        self.pose.orientation = msg.pose.pose.orientation
+        self.pub_goal_marker = self.create_publisher(Marker, '/goal_marker', 10)
         
-        self.velocity.vx = msg.twist.twist.linear.x
-        self.velocity.vy = msg.twist.twist.linear.y
-        _, _, yaw = euler_from_quaternion([
-            msg.pose.pose.orientation.x,
-            msg.pose.pose.orientation.y,
-            msg.pose.pose.orientation.z,
-            msg.pose.pose.orientation.w
-        ])
-        self.velocity.theta = msg.twist.twist.angular.z
-    
-    def scan_cb(self, msg: LaserScan):
-        """Process laser scan"""
+        # Parameter callback
+        self.add_on_set_parameters_callback(self.on_parameters_changed)
+        
+        self.timer = self.create_timer(0.1, self.control_loop)
+        self.get_logger().info("Enhanced DWA Ready. Waiting for Goal...")
+        self.get_logger().info(f"Backwards motion: {self.enable_backwards}")
+        self.get_logger().info(f"Path smoothing: {self.enable_path_smoothing}")
+
+    def load_parameters(self):
+        """Load all parameters from parameter server"""
+        self.max_speed = self.get_parameter('max_speed').value
+        self.max_yaw_rate = self.get_parameter('max_yaw_rate').value
+        self.min_speed = self.get_parameter('min_speed').value
+        self.predict_time = self.get_parameter('predict_time').value
+        self.dt = self.get_parameter('dt').value
+        self.v_reso = self.get_parameter('v_reso').value
+        self.w_reso = self.get_parameter('w_reso').value
+        self.robot_radius = self.get_parameter('robot_radius').value
+        self.goal_cost_gain = self.get_parameter('goal_cost_gain').value
+        self.speed_cost_gain = self.get_parameter('speed_cost_gain').value
+        self.obs_cost_gain = self.get_parameter('obs_cost_gain').value
+        self.smoothness_cost_gain = self.get_parameter('smoothness_cost_gain').value
+        self.max_obstacle_range = self.get_parameter('max_obstacle_range').value
+        self.goal_tolerance = self.get_parameter('goal_tolerance').value
+        self.enable_backwards = self.get_parameter('enable_backwards').value
+        self.enable_path_smoothing = self.get_parameter('enable_path_smoothing').value
+
+    def on_parameters_changed(self, params):
+        """Callback when parameters are updated"""
+        for param in params:
+            if param.name in ['max_speed', 'max_yaw_rate', 'goal_cost_gain', 
+                             'speed_cost_gain', 'obs_cost_gain', 'smoothness_cost_gain',
+                             'enable_backwards', 'enable_path_smoothing']:
+                self.load_parameters()
+                self.get_logger().info(f"Updated parameter: {param.name} = {param.value}")
+        return rclpy.parameter_client.SetParametersResult(successful=True)
+
+    def goal_cb(self, msg):
+        self.goal = np.array([msg.pose.position.x, msg.pose.position.y])
+        self.get_logger().info(f"New Goal: {self.goal}")
+
+    def odom_cb(self, msg):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        o = msg.pose.pose.orientation
+        _, _, self.yaw = euler_from_quaternion([o.x, o.y, o.z, o.w])
+        self.v = msg.twist.twist.linear.x
+        self.w = msg.twist.twist.angular.z
+
+    def scan_cb(self, msg):
         ranges = np.array(msg.ranges)
-        if len(ranges) == 0:
+        if len(ranges) == 0: 
+            self.scan_obs = np.empty((0, 2))
             return
         
+        # Localized view for performance
         angles = np.linspace(msg.angle_min, msg.angle_max, len(ranges))
-        mask = (ranges > 0.05) & (ranges < 4.0)
+        mask = (ranges > 0.05) & (ranges < self.max_obstacle_range)
         
+        if not np.any(mask):
+            self.scan_obs = np.empty((0, 2))
+            return
+            
         obs_x = ranges[mask] * np.cos(angles[mask])
         obs_y = ranges[mask] * np.sin(angles[mask])
         self.scan_obs = np.vstack((obs_x, obs_y)).T
+
+    def motion_model(self, state, u):
+        """state: [x, y, yaw, v, w]"""
+        state[2] += u[1] * self.dt 
+        state[0] += u[0] * math.cos(state[2]) * self.dt
+        state[1] += u[0] * math.sin(state[2]) * self.dt
+        state[3] = u[0]
+        state[4] = u[1]
+        return state
+
+    def calc_trajectory(self, v, w):
+        """Predict trajectory with motion model"""
+        traj = []
+        state = np.array([0.0, 0.0, 0.0, self.v, self.w])
+        time = 0
+        while time <= self.predict_time:
+            state = self.motion_model(state, [v, w])
+            traj.append(state[0:2].copy())
+            time += self.dt
+        return np.array(traj)
+
+    def smooth_trajectory(self, traj):
+        """Apply cubic spline smoothing to reduce jerky paths"""
+        if len(traj) < 4:
+            return traj
         
-        # Update obstacle critic
-        for critic in self.critics:
-            if isinstance(critic, ObstacleCritic):
-                critic.setScanData(self.scan_obs)
-    
-    def goal_cb(self, msg: PoseStamped):
-        """Set goal"""
-        self.goal_pose = msg.pose
-        self.get_logger().info(f"New goal: ({msg.pose.position.x}, {msg.pose.position.y})")
-    
-    def plan_cb(self, msg: Path):
-        """Receive global plan from path planner (e.g., Nav2 planner_server)"""
-        self.global_plan = msg
-        if len(msg.poses) > 0:
-            self.goal_pose = msg.poses[-1].pose
-            self.get_logger().info(f"Received plan with {len(msg.poses)} waypoints")
-    
-    def plan_cb(self, msg: Path):
-        """Receive global plan from path planner (e.g., Nav2 planner_server)"""
-        self.global_plan = msg
-        if len(msg.poses) > 0:
-            self.goal_pose = msg.poses[-1].pose
-            self.get_logger().info(f"Received plan with {len(msg.poses)} waypoints")
-    
-    def transformGlobalPlan(self) -> Path:
-        """Transform global plan to local frame (base_link) like Nav2 does"""
-        if len(self.global_plan.poses) == 0:
-            # Fallback to just goal
-            transformed = Path()
-            transformed.header.frame_id = "base_link"
-            goal_pose_stamped = PoseStamped()
-            goal_pose_stamped.pose = self.goal_pose
-            transformed.poses.append(goal_pose_stamped)
-            return transformed
-        
-        # Transform plan poses from global frame to local frame (base_link)
-        transformed = Path()
-        transformed.header.frame_id = "base_link"
-        
-        for global_pose in self.global_plan.poses:
-            # Convert global frame pose to local frame (simple 2D rotation/translation)
-            gx = global_pose.pose.position.x
-            gy = global_pose.pose.position.y
+        try:
+            x = traj[:, 0]
+            y = traj[:, 1]
             
-            # Translate to robot position
-            dx = gx - self.pose.position.x
-            dy = gy - self.pose.position.y
+            # Create parameter for spline
+            t = np.linspace(0, 1, len(traj))
             
-            # Rotate by -robot_yaw (inverse rotation)
-            _, _, robot_yaw = euler_from_quaternion([
-                self.pose.orientation.x,
-                self.pose.orientation.y,
-                self.pose.orientation.z,
-                self.pose.orientation.w
-            ])
+            # Fit cubic splines
+            cs_x = CubicSpline(t, x)
+            cs_y = CubicSpline(t, y)
             
-            local_x = dx * math.cos(-robot_yaw) - dy * math.sin(-robot_yaw)
-            local_y = dx * math.sin(-robot_yaw) + dy * math.cos(-robot_yaw)
+            # Evaluate at finer resolution
+            t_smooth = np.linspace(0, 1, len(traj) * 2)
+            x_smooth = cs_x(t_smooth)
+            y_smooth = cs_y(t_smooth)
             
-            # Add to transformed plan
-            local_pose = PoseStamped()
-            local_pose.pose.position.x = local_x
-            local_pose.pose.position.y = local_y
-            local_pose.pose.position.z = 0.0
-            local_pose.pose.orientation = global_pose.pose.orientation
-            transformed.poses.append(local_pose)
+            return np.column_stack((x_smooth, y_smooth))
+        except Exception as e:
+            self.get_logger().warn(f"Spline smoothing failed: {e}")
+            return traj
+
+    def check_collision_strict(self, trajectory):
+        """Check collision with margin"""
+        if len(self.scan_obs) == 0: 
+            return False
         
-        return transformed
-    
-    def coreScoringAlgorithm(self) -> TrajectoryScore:
-        """Equivalent to DWBLocalPlanner::coreScoringAlgorithm()"""
-        best: TrajectoryScore = None
-        worst: TrajectoryScore = None
-        legal_trajectory_found = False
-        
-        # Start iteration
-        self.traj_generator.startNewIteration(self.velocity)
-        
-        # Iterate through all candidate trajectories
-        while self.traj_generator.hasMoreTwists():
-            twist = self.traj_generator.nextTwist()
-            trajectory = self.traj_generator.generateTrajectory(
-                self.pose, self.velocity, twist
-            )
+        for point in trajectory:
+            diff = self.scan_obs - point 
+            dist_sq = np.sum(diff**2, axis=1) 
+            min_dist_sq = np.min(dist_sq)
             
-            # Score trajectory
-            try:
-                score = self.scoreTrajectory(trajectory, twist)
-                legal_trajectory_found = True
+            if min_dist_sq <= self.robot_radius**2:
+                return True
+        return False
+
+    def calc_smoothness_cost(self, v, w):
+        """Penalize sudden velocity changes (reduce jerk)"""
+        dv = abs(v - self.last_v)
+        dw = abs(w - self.last_w)
+        return dv + dw
+
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def dwa_search(self):
+        """DWA search with smooth cost and backwards support"""
+        # Dynamic window constraints
+        vs = [self.v - 1.0*self.dt, self.v + 1.0*self.dt, self.w - 2.0*self.dt, self.w + 2.0*self.dt]
+        
+        if self.enable_backwards:
+            dw = [max(vs[0], self.min_speed), 
+                  min(vs[1], self.max_speed), 
+                  max(vs[2], -self.max_yaw_rate), 
+                  min(vs[3], self.max_yaw_rate)]
+        else:
+            dw = [max(vs[0], 0.0), 
+                  min(vs[1], self.max_speed), 
+                  max(vs[2], -self.max_yaw_rate), 
+                  min(vs[3], self.max_yaw_rate)]
+        
+        best_u = [0.0, 0.0]
+        best_cost = float('inf')
+        best_traj = []
+        
+        safe_trajs = []
+        unsafe_trajs = []
+
+        v_samples = np.arange(dw[0], dw[1], self.v_reso)
+        w_samples = np.arange(dw[2], dw[3], self.w_reso)
+        
+        if self.goal is None: 
+            return best_u, best_traj, safe_trajs, unsafe_trajs
+
+        dx = self.goal[0] - self.x
+        dy = self.goal[1] - self.y
+        local_goal_x = dx * math.cos(-self.yaw) - dy * math.sin(-self.yaw)
+        local_goal_y = dx * math.sin(-self.yaw) + dy * math.cos(-self.yaw)
+
+        for v in v_samples:
+            for w in w_samples:
+                traj = self.calc_trajectory(v, w)
                 
-                if best is None or score.total < best.total:
-                    best = score
+                if self.check_collision_strict(traj):
+                    unsafe_trajs.append(traj)
+                    continue
                 
-                if worst is None or score.total > worst.total:
-                    worst = score
-            
-            except Exception as e:
-                # Illegal trajectory (collision, etc.)
-                if self.debug_trajectory_details:
-                    self.get_logger().warn(f"Trajectory rejected: {str(e)}")
-                continue
-        
-        if not legal_trajectory_found:
-            # Rotate in place to find opening
-            self.get_logger().warn("No legal trajectories found! Rotating...")
-            twist = Trajectory2D(vx=0.0, vy=0.0, theta=1.0)
-            trajectory = self.traj_generator.generateTrajectory(
-                self.pose, self.velocity, twist
-            )
-            best = TrajectoryScore(traj=twist)
-            best.total = 0.0
-        
-        return best
-    
-    def scoreTrajectory(self, trajectory: List[Tuple[float, float]],
-                       twist: Trajectory2D) -> TrajectoryScore:
-        """Equivalent to DWBLocalPlanner::scoreTrajectory()"""
-        score = TrajectoryScore(traj=twist)
-        
-        # Call prepare on all critics
-        for critic in self.critics:
-            if not critic.prepare(self.pose, self.velocity, self.goal_pose, 
-                                 self.transformed_plan):
-                self.get_logger().warn(f"Critic {critic.getName()} failed to prepare")
-        
-        # Score with each critic
-        for critic in self.critics:
-            cs = CriticScore()
-            cs.name = critic.getName()
-            cs.scale = critic.getScale()
-            
-            if cs.scale == 0.0:
-                score.scores.append(cs)
-                continue
-            
-            critic_score = critic.scoreTrajectory(trajectory)
-            cs.raw_score = critic_score
-            score.scores.append(cs)
-            
-            # Check for collision or invalid
-            if math.isinf(critic_score):
-                raise Exception(f"Invalid trajectory: {critic.getName()}")
-            
-            score.total += critic_score * cs.scale
-            
-            # Short circuit evaluation
-            if self.short_circuit_trajectory_evaluation:
-                # Stop if this trajectory is already worse than best
-                # (optimization - requires passing best score)
-                pass
-        
-        return score
-    
-    def computeVelocityCommands(self) -> Twist:
-        """Equivalent to DWBLocalPlanner::computeVelocityCommands()"""
-        self.prepareGlobalPlan()
-        
-        best_score = self.coreScoringAlgorithm()
-        
-        # Debrief critics
-        for critic in self.critics:
-            critic.debrief(best_score.traj)
-        
-        cmd_vel = Twist()
-        cmd_vel.linear.x = best_score.traj.vx
-        cmd_vel.linear.y = best_score.traj.vy
-        cmd_vel.angular.z = best_score.traj.theta
-        
-        return cmd_vel
-    
+                safe_trajs.append(traj)
+
+                # Smooth trajectory if enabled
+                if self.enable_path_smoothing:
+                    traj_eval = self.smooth_trajectory(traj)
+                else:
+                    traj_eval = traj
+
+                # Cost evaluation
+                to_goal_angle = math.atan2(local_goal_y - traj_eval[-1][1], 
+                                          local_goal_x - traj_eval[-1][0])
+                heading_cost = abs(self.normalize_angle(to_goal_angle - traj_eval[-1][2] 
+                                   if len(traj_eval[-1]) > 2 else 0))
+                dist_cost = math.sqrt((local_goal_x - traj_eval[-1][0])**2 + 
+                                     (local_goal_y - traj_eval[-1][1])**2)
+                speed_cost = self.max_speed - abs(v)
+                smoothness_cost = self.calc_smoothness_cost(v, w)
+
+                final_cost = (self.goal_cost_gain * heading_cost +
+                             self.speed_cost_gain * speed_cost +
+                             self.obs_cost_gain * dist_cost +
+                             self.smoothness_cost_gain * smoothness_cost)
+
+                if final_cost < best_cost:
+                    best_cost = final_cost
+                    best_u = [v, w]
+                    best_traj = traj
+
+        return best_u, best_traj, safe_trajs, unsafe_trajs
+
     def control_loop(self):
         """Main control loop"""
-        if self.goal_pose.position.x == 0.0 and self.goal_pose.position.y == 0.0:
+        if self.goal is None: 
             return
         
-        # Check if goal reached
-        dist_to_goal = math.hypot(
-            self.goal_pose.position.x - self.pose.position.x,
-            self.goal_pose.position.y - self.pose.position.y
-        )
-        
-        if dist_to_goal < 0.20:
+        dist_to_goal = math.hypot(self.goal[0] - self.x, self.goal[1] - self.y)
+        if dist_to_goal < self.goal_tolerance:
             self.pub_cmd.publish(Twist())
-            self.goal_pose = Pose()
+            self.goal = None
             self.get_logger().info("GOAL REACHED")
             return
+
+        u, best_traj, safe_trajs, unsafe_trajs = self.dwa_search()
+
+        # Store current command for smoothness cost
+        self.last_v = u[0]
+        self.last_w = u[1]
+
+        cmd = Twist()
+        cmd.linear.x = float(u[0])
+        cmd.angular.z = float(u[1])
+        self.pub_cmd.publish(cmd)
         
-        cmd_vel = self.computeVelocityCommands()
-        self.pub_cmd.publish(cmd_vel)
-        self.publish_visualizations()
-    
-    def publish_visualizations(self):
-        """Publish debug visualizations"""
+        self.publish_vis(best_traj, safe_trajs, unsafe_trajs)
+
+    def publish_vis(self, best_traj, safe_trajs, unsafe_trajs):
+        """Publish visualization markers"""
         ma = MarkerArray()
         
-        if len(self.scan_obs) > 0:
-            m_obs = Marker()
-            m_obs.header.frame_id = "base_link"
-            m_obs.type = Marker.POINTS
-            m_obs.action = Marker.ADD
-            m_obs.id = 0
-            m_obs.scale.x = 0.05
-            m_obs.scale.y = 0.05
-            m_obs.color.r = 1.0
-            m_obs.color.a = 1.0
-            for p in self.scan_obs[::5]:
-                m_obs.points.append(Point(x=p[0], y=p[1]))
-            ma.markers.append(m_obs)
+        # 1. Unsafe Paths (RED)
+        if unsafe_trajs:
+            m_unsafe = Marker()
+            m_unsafe.header.frame_id = "base_link"
+            m_unsafe.type = Marker.LINE_LIST
+            m_unsafe.action = Marker.ADD
+            m_unsafe.id = 1
+            m_unsafe.scale.x = 0.002
+            m_unsafe.color.r = 1.0
+            m_unsafe.color.a = 0.2
+            for traj in unsafe_trajs[::4]:
+                for i in range(len(traj)-1):
+                    m_unsafe.points.append(Point(x=traj[i][0], y=traj[i][1]))
+                    m_unsafe.points.append(Point(x=traj[i+1][0], y=traj[i+1][1]))
+            ma.markers.append(m_unsafe)
         
+        # 2. Safe Paths (BLUE)
+        if safe_trajs:
+            m_safe = Marker()
+            m_safe.header.frame_id = "base_link"
+            m_safe.type = Marker.LINE_LIST
+            m_safe.action = Marker.ADD
+            m_safe.id = 2
+            m_safe.scale.x = 0.002
+            m_safe.color.b = 1.0
+            m_safe.color.a = 0.2
+            for traj in safe_trajs[::2]:
+                for i in range(len(traj)-1):
+                    m_safe.points.append(Point(x=traj[i][0], y=traj[i][1]))
+                    m_safe.points.append(Point(x=traj[i+1][0], y=traj[i+1][1]))
+            ma.markers.append(m_safe)
+
+        # 3. Best Path (GREEN)
+        if len(best_traj) > 0:
+            m_best = Marker()
+            m_best.header.frame_id = "base_link"
+            m_best.type = Marker.LINE_STRIP
+            m_best.action = Marker.ADD
+            m_best.id = 3
+            m_best.scale.x = 0.03
+            m_best.color.g = 1.0
+            m_best.color.a = 1.0
+            for p in best_traj:
+                m_best.points.append(Point(x=p[0], y=p[1]))
+            ma.markers.append(m_best)
+            
         self.pub_vis.publish(ma)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DWBLocalPlanner()
+    node = EnhancedDWAPlanner()
     rclpy.spin(node)
     rclpy.shutdown()
 
