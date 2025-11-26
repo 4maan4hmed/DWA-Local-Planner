@@ -1,6 +1,9 @@
 # Clean DWA Planner
 
 A lightweight, well-structured implementation of the Dynamic Window Approach (DWA) algorithm for real-time robot navigation and obstacle avoidance in ROS 2.
+## Demo
+[![Video on YouTube](https://img.youtube.com/vi/oKKJ1gelKbM/0.jpg)](https://youtu.be/oKKJ1gelKbM)
+
 
 ## Overview
 
